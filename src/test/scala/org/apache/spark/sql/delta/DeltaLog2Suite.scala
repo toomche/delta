@@ -26,7 +26,7 @@ import org.scalatest.time.SpanSugar._
 // scalastyle:off: removeFile
 class DeltaLog2Suite extends StreamTest {
 
-  override val streamingTimeout = 180.seconds
+  override val streamingTimeout = 1800.seconds
 
   import testImplicits._
 
@@ -58,6 +58,7 @@ class DeltaLog2Suite extends StreamTest {
             override def run(): Unit =
               (1 to 15).foreach { i =>
                 inputData.addData(i)
+                Thread.sleep(1000)
                 query.processAllAvailable()
               }
           })
