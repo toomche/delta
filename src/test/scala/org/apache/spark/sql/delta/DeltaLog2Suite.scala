@@ -54,22 +54,28 @@ class DeltaLog2Suite extends StreamTest {
             inputData.addData(i)
             query.processAllAvailable()
           }
-          new Thread(new Runnable {
+          val writeThread = new Thread(new Runnable {
             override def run(): Unit =
               (1 to 15).foreach { i =>
                 inputData.addData(i)
                 query.processAllAvailable()
               }
-          }).start()
+          })
+          writeThread.start()
           val optimizeTableInDelta = CompactTableInDelta(log,
             new DeltaOptions(Map[String, String](), df.sparkSession.sqlContext.conf), Seq(), Map(
               CompactTableInDelta.COMPACT_VERSION_OPTION -> "8",
-              CompactTableInDelta.COMPACT_NUM_FILE_PER_DIR -> "1"
+              CompactTableInDelta.COMPACT_NUM_FILE_PER_DIR -> "1",
+              CompactTableInDelta.COMPACT_RETRY_TIMES_FOR_LOCK -> "60"
             ))
           optimizeTableInDelta.run(df.sparkSession)
+          writeThread.join()
           val fileNum = new File(outputDir.getCanonicalPath).listFiles().
             filter(f => f.getName.endsWith(".parquet")).length
-          assert(fileNum == 7)
+
+          val outputDf = spark.read.format("delta").load(outputDir.getCanonicalPath)
+          assert(outputDf.count() == 30)
+          assert(fileNum == 22)
 
 
         } finally {

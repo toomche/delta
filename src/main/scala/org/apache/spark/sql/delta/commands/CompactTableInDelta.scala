@@ -26,22 +26,8 @@ case class CompactTableInDelta(
     val compactRetryTimesForLock = configuration.get(COMPACT_RETRY_TIMES_FOR_LOCK)
       .map(_.toInt).getOrElse(0)
 
-    _run(sparkSession, compactRetryTimesForLock)
-    Seq[Row]()
-  }
-
-  protected def _run(sparkSession: SparkSession, tries: Int): (Seq[Action], Long) = {
-    if (tries < 0) {
-      throw new java.util.ConcurrentModificationException(
-        s"Compaction operation fails to lock ${deltaLog.dataPath}")
-    }
-    try {
-      val (items, targetVersion) = deltaLog.withNewTransaction { txn =>
-        val (actions, version) = optimize(txn, sparkSession)
-        val operation = DeltaOperations.Optimize(Seq(), Seq(), 0, false)
-        txn.commit(actions, operation)
-        (actions, version)
-      }
+    val (items, targetVersion, commitSuccess) = _run(sparkSession, compactRetryTimesForLock)
+    if (commitSuccess) {
       // trigger cleanup deltaLog
       recordDeltaOperation(deltaLog, "delta.log.compact.cleanup") {
         doLogCleanup(targetVersion)
@@ -51,18 +37,48 @@ case class CompactTableInDelta(
       recordDeltaOperation(deltaLog, "delta.data.compact.cleanup") {
         doRemoveFileCleanup(items)
       }
-      (items, targetVersion)
+    } else {
+      rollback(items)
+    }
+
+    Seq[Row]()
+  }
+
+  protected def _run(sparkSession: SparkSession, tries: Int,
+                     actions: Seq[Action] = Seq()): (Seq[Action], Long, Boolean) = {
+
+    val compactRetryTimesForLock = configuration.get(COMPACT_RETRY_TIMES_FOR_LOCK)
+      .map(_.toInt).getOrElse(0)
+
+    var items: Seq[Action] = null
+    var targetVersion: Long = -1
+    var success = false
+    try {
+      deltaLog.withNewTransaction { txn =>
+        val (actions, version) = optimize(txn, sparkSession, tries < compactRetryTimesForLock)
+        val operation = DeltaOperations.Optimize(Seq(), Seq(), 0, false)
+        // if we found the Optimization is trying, then optimize will return empty actions
+        if (tries == compactRetryTimesForLock) {
+          items = actions
+        }
+        targetVersion = version
+        txn.commit(actions, operation)
+        success = true
+      }
     } catch {
       case e@(_: java.util.ConcurrentModificationException |
               _: DeltaConcurrentModificationException) =>
         logInfo(s"DeltaConcurrentModificationException throwed. tried ${tries}")
+        // clean data aready been written
         Thread.sleep(1000)
-        _run(sparkSession, tries - 1)
-      case e: Exception => throw e
+        _run(sparkSession, tries - 1, items)
+      case e: Exception =>
+        logError("DeltaConcurrentModificationException throwed", e)
+
     }
+    (items, targetVersion, success)
 
   }
-
 
   protected def doLogCleanup(targetVersion: Long) = {
     val fs = deltaLog.fs
@@ -123,7 +139,27 @@ case class CompactTableInDelta(
     logInfo(s"Deleted $numDeleted  files in optimization progress")
   }
 
-  protected def optimize(txn: OptimisticTransaction, sparkSession: SparkSession) = {
+  protected def rollback(items: Seq[Action]) = {
+    var numDeleted = 0
+    items.filter(item => item.isInstanceOf[AddFile])
+      .map(item => item.asInstanceOf[AddFile])
+      .foreach { item =>
+        val path = new Path(deltaLog.dataPath, item.path)
+        val pathCrc = new Path(deltaLog.dataPath, "." + item.path + ".crc")
+        val fs = deltaLog.fs
+        try {
+          fs.delete(path, false)
+          fs.delete(pathCrc, false)
+          numDeleted += 1
+        } catch {
+          case e: Exception =>
+        }
+      }
+    logInfo(s"Deleted $numDeleted  files in optimization progress")
+  }
+
+  protected def optimize(txn: OptimisticTransaction, sparkSession: SparkSession,
+                         isTry: Boolean): (Seq[Action], Long) = {
     import sparkSession.implicits._
     if (txn.readVersion > -1) {
       // For now, we only support the append mode(SaveMode/OutputMode).
@@ -161,6 +197,10 @@ case class CompactTableInDelta(
     // check version is valid
     deltaLog.history.checkVersionExists(version)
 
+    if (isTry) {
+      return (Seq[Action](), version)
+    }
+
     val newFiles = ArrayBuffer[AddFile]()
     val deletedFiles = ArrayBuffer[RemoveFile]()
 
@@ -182,21 +222,26 @@ case class CompactTableInDelta(
       .groupBy("prefix").agg(F.collect_list("addFile").as("addFiles")).as[PrefixAddFileList]
       .collect().toSeq
 
+    val compactNumFilePerDir = configuration.get(COMPACT_NUM_FILE_PER_DIR)
+      .map(f => f.toInt).getOrElse(1)
+
     filesShouldBeOptimized.foreach { fileList =>
       val tempFiles = fileList.addFiles.map { addFile =>
         new Path(deltaLog.dataPath, addFile.path).toString
       }
-      val df = sparkSession.read.parquet(tempFiles: _*)
-        .repartition(configuration.get(COMPACT_NUM_FILE_PER_DIR)
-          .map(f => f.toInt).getOrElse(1))
+      // if the file num is smaller then we need, skip
+      if (tempFiles.length >= compactNumFilePerDir) {
+        val df = sparkSession.read.parquet(tempFiles: _*)
+          .repartition()
 
-      newFiles ++= txn.writeFiles(df, Some(options))
-      deletedFiles ++= fileList.addFiles.map(_.remove)
+        newFiles ++= txn.writeFiles(df, Some(options))
+        deletedFiles ++= fileList.addFiles.map(_.remove)
+      }
     }
 
     logInfo(s"Add ${newFiles.size} files in optimization progress")
     logInfo(s"Mark remove ${deletedFiles} files in optimization progress")
-    (newFiles ++ deletedFiles, version)
+    return (newFiles ++ deletedFiles, version)
   }
 
   override protected val canMergeSchema: Boolean = false
