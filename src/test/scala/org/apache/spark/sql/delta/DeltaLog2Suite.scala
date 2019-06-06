@@ -18,6 +18,7 @@ package org.apache.spark.sql.delta
 
 import java.io.File
 
+import org.apache.spark.sql.delta.actions.{Action, AddFile, RemoveFile}
 import org.apache.spark.sql.delta.commands.CompactTableInDelta
 import org.apache.spark.sql.execution.streaming.MemoryStream
 import org.apache.spark.sql.streaming._
@@ -119,7 +120,7 @@ class DeltaLog2Suite extends StreamTest {
               CompactTableInDelta.COMPACT_NUM_FILE_PER_DIR -> "1",
               CompactTableInDelta.COMPACT_RETRY_TIMES_FOR_LOCK -> "60"
             ))
-          optimizeTableInDelta.run(df.sparkSession)
+          val items = optimizeTableInDelta.run(df.sparkSession)
           writeThread.join()
 
           def recursiveListFiles(f: File): Array[File] = {
@@ -129,13 +130,17 @@ class DeltaLog2Suite extends StreamTest {
 
 
           val fileNum = recursiveListFiles(new File(outputDir.getCanonicalPath)).filter { f =>
-            f.getName.endsWith(".parquet") && f.getName.contains("checkpoint")
+            f.getName.endsWith(".parquet") && !f.getName.contains("checkpoint")
           }.length
 
 
+          val acitons = items.map(f => Action.fromJson(f.getString(0)))
+          val newFilesSize = acitons.filter(f => f.isInstanceOf[AddFile]).size
+          val removeFilesSize = acitons.filter(f => f.isInstanceOf[RemoveFile]).size
+
           val outputDf = spark.read.format("delta").load(outputDir.getCanonicalPath)
           assert(outputDf.count() == 30)
-          //          assert(fileNum == 22)
+          assert(fileNum == (30 - removeFilesSize + newFilesSize))
 
 
         } finally {
