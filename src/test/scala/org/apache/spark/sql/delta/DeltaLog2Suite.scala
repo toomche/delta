@@ -85,4 +85,65 @@ class DeltaLog2Suite extends StreamTest {
       }
     }
   }
+  test("append mode with partitions") {
+    failAfter(streamingTimeout) {
+      withTempDirs { (outputDir, checkpointDir) =>
+        val inputData = MemoryStream[A]
+        val df = inputData.toDF()
+        val query = df.writeStream
+          .option("checkpointLocation", checkpointDir.getCanonicalPath)
+          .outputMode(OutputMode.Append())
+          .format("delta")
+          .partitionBy("key")
+          .start(outputDir.getCanonicalPath)
+        val log = DeltaLog.forTable(spark, outputDir.getCanonicalPath)
+        try {
+          (1 to 15).foreach { i =>
+            val a = if (i > 3) "jack" else "william"
+            inputData.addData(A(a, i))
+            query.processAllAvailable()
+          }
+          val writeThread = new Thread(new Runnable {
+            override def run(): Unit =
+              (1 to 15).foreach { i =>
+                val a = if (i > 4) "jack" else "william"
+                inputData.addData(A(a, i))
+                Thread.sleep(1000)
+                query.processAllAvailable()
+              }
+          })
+          writeThread.start()
+          val optimizeTableInDelta = CompactTableInDelta(log,
+            new DeltaOptions(Map[String, String](), df.sparkSession.sqlContext.conf), Seq(), Map(
+              CompactTableInDelta.COMPACT_VERSION_OPTION -> "8",
+              CompactTableInDelta.COMPACT_NUM_FILE_PER_DIR -> "1",
+              CompactTableInDelta.COMPACT_RETRY_TIMES_FOR_LOCK -> "60"
+            ))
+          optimizeTableInDelta.run(df.sparkSession)
+          writeThread.join()
+
+          def recursiveListFiles(f: File): Array[File] = {
+            val these = f.listFiles
+            these ++ these.filter(_.isDirectory).flatMap(recursiveListFiles)
+          }
+
+
+          val fileNum = recursiveListFiles(new File(outputDir.getCanonicalPath)).filter { f =>
+            f.getName.endsWith(".parquet") && f.getName.contains("checkpoint")
+          }.length
+
+
+          val outputDf = spark.read.format("delta").load(outputDir.getCanonicalPath)
+          assert(outputDf.count() == 30)
+          //          assert(fileNum == 22)
+
+
+        } finally {
+          query.stop()
+        }
+      }
+    }
+  }
 }
+
+case class A(key: String, value: Int)
