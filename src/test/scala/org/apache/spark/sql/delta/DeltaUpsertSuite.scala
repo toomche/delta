@@ -84,9 +84,7 @@ class DeltaUpsertSuite extends StreamTest {
 
           val outputDf = spark.read.format("delta").load(outputDir.getCanonicalPath)
           assert(outputDf.count() == 16)
-          assert(fileNum == (15 + newFilesSize)) notifyAll()
-
-
+          assert(fileNum == (15 + newFilesSize))
         } finally {
           query.stop()
         }
@@ -138,6 +136,42 @@ class DeltaUpsertSuite extends StreamTest {
           val outputDf = spark.read.format("delta").load(outputDir.getCanonicalPath)
           assert(outputDf.count() == 16)
           assert(fileNum == (15 + newFilesSize))
+
+
+        } finally {
+          query.stop()
+        }
+      }
+    }
+  }
+
+  test("upsert stream table with stream") {
+    failAfter(streamingTimeout) {
+      withTempDirs { (outputDir, checkpointDir) =>
+        val inputData = MemoryStream[A2]
+        val df = inputData.toDF()
+        val query = df.writeStream
+          .option("checkpointLocation", checkpointDir.getCanonicalPath)
+          .option("idCols", "key,value")
+          .outputMode(OutputMode.Append())
+          .format("org.apache.spark.sql.delta.sources.MLSQLDeltaDataSource")
+          .start(outputDir.getCanonicalPath)
+        val log = DeltaLog.forTable(spark, outputDir.getCanonicalPath)
+        try {
+          (1 to 15).foreach { i =>
+            val a = if (i > 3) "jack" else "william"
+            inputData.addData(A2(a, i, i + 1))
+            query.processAllAvailable()
+          }
+
+          val data = Seq(A2("william", 1, 2), A2("william", 16, 2))
+          data.foreach { d =>
+            inputData.addData(d)
+            query.processAllAvailable()
+          }
+
+          val outputDf = spark.read.format("delta").load(outputDir.getCanonicalPath)
+          assert(outputDf.count() == 16)
 
 
         } finally {

@@ -1,5 +1,6 @@
 package org.apache.spark.sql.delta.commands
 
+import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.delta._
 import org.apache.spark.sql.delta.actions.{Action, AddFile, SetTransaction}
 import org.apache.spark.sql.delta.schema.{ImplicitMetadataOperation, SchemaUtils}
@@ -9,7 +10,7 @@ import org.apache.spark.sql.streaming.OutputMode
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{Dataset, Row, SaveMode, SparkSession, functions => F}
 
-case class UpsertTableInDelta(data: Dataset[_],
+case class UpsertTableInDelta(_data: Dataset[_],
                               saveMode: Option[SaveMode],
                               outputMode: Option[OutputMode],
                               deltaLog: DeltaLog,
@@ -48,7 +49,7 @@ case class UpsertTableInDelta(data: Dataset[_],
           val queryId = sparkSession.sparkContext.getLocalProperty(StreamExecution.QUERY_ID_KEY)
           assert(queryId != null)
 
-          if (SchemaUtils.typeExistsRecursively(data.schema)(_.isInstanceOf[NullType])) {
+          if (SchemaUtils.typeExistsRecursively(_data.schema)(_.isInstanceOf[NullType])) {
             throw DeltaErrors.streamWriteNullTypeException
           }
 
@@ -57,7 +58,7 @@ case class UpsertTableInDelta(data: Dataset[_],
           // See Schema Management design doc for details
           updateMetadata(
             txn,
-            data,
+            _data,
             partitionColumns,
             configuration = Map.empty,
             false)
@@ -82,6 +83,23 @@ case class UpsertTableInDelta(data: Dataset[_],
   }
 
   def upsert(txn: OptimisticTransaction, sparkSession: SparkSession): Seq[Action] = {
+
+    // if _data is stream dataframe, we should convert it to normal
+    // dataframe and so we can join it later
+    val data = if (_data.isStreaming) {
+      class ConvertStreamDataFrame[T](encoder: ExpressionEncoder[T]) {
+
+        def toBatch(data: Dataset[_]): Dataset[_] = {
+          val resolvedEncoder = encoder.resolveAndBind(
+            data.logicalPlan.output,
+            data.sparkSession.sessionState.analyzer)
+          val rdd = data.queryExecution.toRdd.map(resolvedEncoder.fromRow)(encoder.clsTag)
+          val ds = data.sparkSession.createDataset(rdd)(encoder)
+          ds
+        }
+      }
+      new ConvertStreamDataFrame[Row](_data.asInstanceOf[Dataset[Row]].exprEnc).toBatch(_data)
+    } else _data
 
     import sparkSession.implicits._
     val snapshot = deltaLog.snapshot
@@ -147,11 +165,11 @@ case class UpsertTableInDelta(data: Dataset[_],
     // So please make sure you have configured the partition columns or make compaction frequently
 
     val filterFiles = filterFilesDataSet.collect
-    val dataInTableWeShouldProcess = deltaLog.createDataFrame(snapshot, filterFiles, false, None)
+    val dataInTableWeShouldProcess = deltaLog.createDataFrame(snapshot, filterFiles, false)
 
-    val dataInTableWeShouldProcessWithFileName = dataInTableWeShouldProcess.select(
-      F.input_file_name().as(UpsertTableInDelta.FILE_NAME),
-      F.col("*"))
+    val dataInTableWeShouldProcessWithFileName = dataInTableWeShouldProcess.
+      withColumn(UpsertTableInDelta.FILE_NAME, F.input_file_name())
+
 
     // get all files that are affected by the new data(update)
     val filesAreAffected = dataInTableWeShouldProcessWithFileName.join(data,
@@ -168,7 +186,7 @@ case class UpsertTableInDelta(data: Dataset[_],
     val deletedFiles = filesAreAffectedWithDeltaFormat.map(_.remove)
 
     // we should get  not changed records in affected files and write them back again
-    val affectedRecords = deltaLog.createDataFrame(snapshot, filesAreAffectedWithDeltaFormat, false, None)
+    val affectedRecords = deltaLog.createDataFrame(snapshot, filesAreAffectedWithDeltaFormat, false)
 
     val notChangedRecords = affectedRecords.join(data,
       usingColumns = idColsList, joinType = "leftanti").
