@@ -1,13 +1,17 @@
 package org.apache.spark.sql.delta.commands
 
-import org.apache.spark.sql.delta.actions.{Action, AddFile}
-import org.apache.spark.sql.delta.schema.ImplicitMetadataOperation
-import org.apache.spark.sql.delta.{DeltaLog, DeltaOperations, DeltaOptions, OptimisticTransaction}
+import org.apache.spark.sql.delta._
+import org.apache.spark.sql.delta.actions.{Action, AddFile, SetTransaction}
+import org.apache.spark.sql.delta.schema.{ImplicitMetadataOperation, SchemaUtils}
 import org.apache.spark.sql.execution.command.RunnableCommand
-import org.apache.spark.sql.types.{DoubleType, IntegerType, LongType, ShortType}
+import org.apache.spark.sql.execution.streaming.StreamExecution
+import org.apache.spark.sql.streaming.OutputMode
+import org.apache.spark.sql.types._
 import org.apache.spark.sql.{Dataset, Row, SaveMode, SparkSession, functions => F}
 
 case class UpsertTableInDelta(data: Dataset[_],
+                              saveMode: Option[SaveMode],
+                              outputMode: Option[OutputMode],
                               deltaLog: DeltaLog,
                               options: DeltaOptions,
                               partitionColumns: Seq[String],
@@ -17,13 +21,59 @@ case class UpsertTableInDelta(data: Dataset[_],
   with DeltaCommand with DeltaCommandsFun {
   override def run(sparkSession: SparkSession): Seq[Row] = {
     assert(configuration.contains(UpsertTableInDelta.ID_COLS), "idCols is required ")
+
+    if (outputMode.isDefined) {
+      assert(outputMode.get == OutputMode.Append(), "append is required ")
+    }
+
+    if (saveMode.isDefined) {
+      assert(saveMode.get == SaveMode.Append, "append is required ")
+    }
+
+
     var actions = Seq[Action]()
-    deltaLog.withNewTransaction { txn =>
-      actions = upsert(txn, sparkSession)
-      val operation = DeltaOperations.Write(SaveMode.Overwrite,
-        Option(partitionColumns),
-        options.replaceWhere)
-      txn.commit(actions, operation)
+
+
+    saveMode match {
+      case Some(mode) =>
+        deltaLog.withNewTransaction { txn =>
+          actions = upsert(txn, sparkSession)
+          val operation = DeltaOperations.Write(SaveMode.Overwrite,
+            Option(partitionColumns),
+            options.replaceWhere)
+          txn.commit(actions, operation)
+        }
+      case None => outputMode match {
+        case Some(mode) =>
+          val queryId = sparkSession.sparkContext.getLocalProperty(StreamExecution.QUERY_ID_KEY)
+          assert(queryId != null)
+
+          if (SchemaUtils.typeExistsRecursively(data.schema)(_.isInstanceOf[NullType])) {
+            throw DeltaErrors.streamWriteNullTypeException
+          }
+
+          val txn = deltaLog.startTransaction()
+          // Streaming sinks can't blindly overwrite schema.
+          // See Schema Management design doc for details
+          updateMetadata(
+            txn,
+            data,
+            partitionColumns,
+            configuration = Map.empty,
+            false)
+
+          val currentVersion = txn.txnVersion(queryId)
+          val batchId = configuration(UpsertTableInDelta.BATCH_ID).toLong
+          if (currentVersion >= batchId) {
+            logInfo(s"Skipping already complete epoch $batchId, in query $queryId")
+          } else {
+            actions = upsert(txn, sparkSession)
+            val setTxn = SetTransaction(queryId,
+              batchId, Some(deltaLog.clock.getTimeMillis())) :: Nil
+            val info = DeltaOperations.StreamingUpdate(outputMode.get, queryId, batchId)
+            txn.commit(setTxn ++ actions, info)
+          }
+      }
     }
 
     if (actions.size == 0) Seq[Row]() else {
@@ -137,6 +187,7 @@ case class UpsertTableInDelta(data: Dataset[_],
 
 object UpsertTableInDelta {
   val ID_COLS = "idCols"
+  val BATCH_ID = "batchId"
   val FILE_NAME = "__fileName__"
 }
 

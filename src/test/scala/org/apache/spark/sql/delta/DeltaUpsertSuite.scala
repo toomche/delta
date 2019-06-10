@@ -18,6 +18,7 @@ package org.apache.spark.sql.delta
 
 import java.io.File
 
+import org.apache.spark.sql.SaveMode
 import org.apache.spark.sql.delta.actions.{Action, AddFile, RemoveFile}
 import org.apache.spark.sql.delta.commands.UpsertTableInDelta
 import org.apache.spark.sql.execution.streaming.MemoryStream
@@ -60,7 +61,7 @@ class DeltaUpsertSuite extends StreamTest {
 
           val data = Seq(A2("william", 1, 2), A2("william", 16, 2)).toDF()
 
-          val upsertTableInDelta = UpsertTableInDelta(data, log,
+          val upsertTableInDelta = UpsertTableInDelta(data, Option(SaveMode.Append), None, log,
             new DeltaOptions(Map[String, String](), df.sparkSession.sessionState.conf),
             Seq(),
             Map("idCols" -> "key,value"))
@@ -83,7 +84,60 @@ class DeltaUpsertSuite extends StreamTest {
 
           val outputDf = spark.read.format("delta").load(outputDir.getCanonicalPath)
           assert(outputDf.count() == 16)
-          assert(fileNum == (15 - removeFilesSize + newFilesSize)) notifyAll()
+          assert(fileNum == (15 + newFilesSize)) notifyAll()
+
+
+        } finally {
+          query.stop()
+        }
+      }
+    }
+  }
+
+  test("upsert stream table without partition") {
+    failAfter(streamingTimeout) {
+      withTempDirs { (outputDir, checkpointDir) =>
+        val inputData = MemoryStream[A2]
+        val df = inputData.toDF()
+        val query = df.writeStream
+          .option("checkpointLocation", checkpointDir.getCanonicalPath)
+          .outputMode(OutputMode.Append())
+          .format("delta")
+          .start(outputDir.getCanonicalPath)
+        val log = DeltaLog.forTable(spark, outputDir.getCanonicalPath)
+        try {
+          (1 to 15).foreach { i =>
+            val a = if (i > 3) "jack" else "william"
+            inputData.addData(A2(a, i, i + 1))
+            query.processAllAvailable()
+          }
+
+          val data = Seq(A2("william", 1, 2), A2("william", 16, 2)).toDF()
+
+          val upsertTableInDelta = UpsertTableInDelta(data, Option(SaveMode.Append), None, log,
+            new DeltaOptions(Map[String, String](), df.sparkSession.sessionState.conf),
+            Seq(),
+            Map("idCols" -> "key,value"))
+          val items = upsertTableInDelta.run(df.sparkSession)
+
+          def recursiveListFiles(f: File): Array[File] = {
+            val these = f.listFiles
+            these ++ these.filter(_.isDirectory).flatMap(recursiveListFiles)
+          }
+
+
+          val fileNum = recursiveListFiles(new File(outputDir.getCanonicalPath)).filter { f =>
+            f.getName.endsWith(".parquet") && !f.getName.contains("checkpoint")
+          }.length
+
+
+          val acitons = items.map(f => Action.fromJson(f.getString(0)))
+          val newFilesSize = acitons.filter(f => f.isInstanceOf[AddFile]).size
+          val removeFilesSize = acitons.filter(f => f.isInstanceOf[RemoveFile]).size
+
+          val outputDf = spark.read.format("delta").load(outputDir.getCanonicalPath)
+          assert(outputDf.count() == 16)
+          assert(fileNum == (15 + newFilesSize))
 
 
         } finally {
