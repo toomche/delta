@@ -1,21 +1,19 @@
 package org.apache.spark.sql.delta.commands
 
 import org.apache.hadoop.fs.{FileStatus, Path}
-import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.delta.actions.{Action, AddFile, Metadata, RemoveFile}
-import org.apache.spark.sql.delta.files.DelayedCommitProtocol
-import org.apache.spark.sql.delta.schema.{DeltaInvariantCheckerExec, ImplicitMetadataOperation, Invariants, SchemaUtils}
+import org.apache.spark.sql.delta.actions.{Action, AddFile, RemoveFile}
+import org.apache.spark.sql.delta.schema.{DeltaInvariantCheckerExec, ImplicitMetadataOperation, Invariants}
 import org.apache.spark.sql.delta.{DeltaConcurrentModificationException, _}
 import org.apache.spark.sql.execution.command.RunnableCommand
 import org.apache.spark.sql.execution.datasources.FileFormatWriter
-import org.apache.spark.sql.execution.{QueryExecution, SQLExecution}
+import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.{Dataset, Row, SparkSession, functions => F}
 
 import scala.collection.mutable.ArrayBuffer
 
 /**
  *
- * CompactTableInDelta is used to compaction small files to big files.
+ * CompactTableInDelta is used to compact small files into big files.
  * This class requires the delta table should satisfied the following requirements:
  *
  * 1. There are at least one checkpoint have been generated.
@@ -35,7 +33,7 @@ case class CompactTableInDelta(
                               )
   extends RunnableCommand
     with ImplicitMetadataOperation
-    with DeltaCommand {
+    with DeltaCommand with DeltaCommandsFun{
 
   import CompactTableInDelta._
 
@@ -329,26 +327,7 @@ case class CompactTableInDelta(
     logInfo(s"Mark remove ${deletedFiles} files in optimization progress")
     return (newFiles ++ deletedFiles, version)
   }
-
-  protected def normalizeData(metadata: Metadata,
-                              data: Dataset[_],
-                              partitionCols: Seq[String]): (QueryExecution, Seq[Attribute]) = {
-    val normalizedData = SchemaUtils.normalizeColumnNames(metadata.schema, data)
-    val cleanedData = SchemaUtils.dropNullTypeColumns(normalizedData)
-    val queryExecution = if (cleanedData.schema != normalizedData.schema) {
-      // For batch executions, we need to use the latest DataFrame query execution
-      cleanedData.queryExecution
-    } else {
-      // For streaming workloads, we need to use the QueryExecution created from StreamExecution
-      data.queryExecution
-    }
-    queryExecution -> cleanedData.queryExecution.analyzed.output
-  }
-
-
-  protected def getCommitter(outputPath: Path): DelayedCommitProtocol =
-    new DelayedCommitProtocol("delta", outputPath.toString, None)
-
+  
   override protected val canMergeSchema: Boolean = false
   override protected val canOverwriteSchema: Boolean = false
 

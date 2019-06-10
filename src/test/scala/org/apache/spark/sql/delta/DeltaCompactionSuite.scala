@@ -25,7 +25,7 @@ import org.apache.spark.sql.streaming._
 import org.scalatest.time.SpanSugar._
 
 // scalastyle:off: removeFile
-class DeltaLog2Suite extends StreamTest {
+class DeltaCompactionSuite extends StreamTest {
 
   override val streamingTimeout = 1800.seconds
 
