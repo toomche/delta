@@ -22,6 +22,8 @@ import java.util.concurrent.{Callable, TimeUnit}
 import java.util.concurrent.locks.ReentrantLock
 
 import scala.concurrent.{ExecutionContext, Future}
+import scala.util.Try
+import scala.util.control.NonFatal
 
 import com.databricks.spark.util.TagDefinitions._
 import org.apache.spark.sql.delta.actions._
@@ -36,9 +38,7 @@ import org.apache.hadoop.fs.Path
 
 import org.apache.spark.SparkContext
 import org.apache.spark.sql._
-import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.{Resolver, UnresolvedAttribute}
-import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.expressions.{And, Attribute, Expression, In, InSet, Literal}
 import org.apache.spark.sql.catalyst.plans.logical.AnalysisHelper
 import org.apache.spark.sql.execution.datasources._
@@ -134,17 +134,25 @@ class DeltaLog private(
     val checkpointFiles = c.parts
       .map(p => checkpointFileWithParts(logPath, c.version, p))
       .getOrElse(Seq(checkpointFileSingular(logPath, c.version)))
+    val deltas = store.listFrom(deltaFile(logPath, c.version + 1))
+      .filter(f => isDeltaFile(f.getPath))
+      .toArray
+    val deltaVersions = deltas.map(f => deltaVersion(f.getPath))
+    verifyDeltaVersions(deltaVersions)
+    val newVersion = deltaVersions.lastOption.getOrElse(c.version)
+    val deltaFiles = ((c.version + 1) to newVersion).map(deltaFile(logPath, _))
+    logInfo(s"Loading version $newVersion starting from checkpoint ${c.version}")
     try {
       val snapshot = new Snapshot(
         logPath,
-        c.version,
+        newVersion,
         None,
-        checkpointFiles,
+        checkpointFiles ++ deltaFiles,
         minFileRetentionTimestamp,
         this,
-        // we don't want to make an additional RPC here to get commit timestamps. The update method
-        // will take care of that if there are delta files.
-        -1L)
+        // we don't want to make an additional RPC here to get commit timestamps when "deltas" is
+        // empty. The next "update" call will take care of that if there are delta files.
+        deltas.lastOption.map(_.getModificationTime).getOrElse(-1L))
 
       validateChecksum(snapshot)
       snapshot
@@ -157,8 +165,24 @@ class DeltaLog private(
     new Snapshot(logPath, -1, None, Nil, minFileRetentionTimestamp, this, -1L)
   }
 
-  // Load any deltas that have arrived since the checkpoint we initialized with.
-  update()
+  if (currentSnapshot.version == -1) {
+    // No checkpoint exists. Call "update" to load delta files.
+    update()
+  } else {
+    protocolRead()
+  }
+
+  /**
+   * Verify the versions are contiguous.
+   */
+  private def verifyDeltaVersions(versions: Array[Long]): Unit = {
+    // Turn this to a vector so that we can compare it with a range.
+    val deltaVersions = versions.toVector
+    if (deltaVersions.nonEmpty &&
+      (deltaVersions.head to deltaVersions.last) != deltaVersions) {
+      throw new IllegalStateException(s"versions ($deltaVersions) are not contiguous")
+    }
+  }
 
   /** Returns the current snapshot. Note this does not automatically `update()`. */
   def snapshot: Snapshot = currentSnapshot
@@ -259,11 +283,8 @@ class DeltaLog private(
           return currentSnapshot
         }
 
-        // Turn this to a vector so that we can compare it with a range.
-        val deltaVersions = deltas.map(f => deltaVersion(f.getPath)).toVector
-        if ((deltaVersions.head to deltaVersions.last) != deltaVersions) {
-          throw new IllegalStateException(s"versions (${deltaVersions}) are not contiguous")
-        }
+        val deltaVersions = deltas.map(f => deltaVersion(f.getPath))
+        verifyDeltaVersions(deltaVersions)
         val lastChkpoint = lastCheckpoint.map(CheckpointInstance.apply)
             .getOrElse(CheckpointInstance.MaxValue)
         val checkpointFiles = checkpoints.map(f => CheckpointInstance(f.getPath))
@@ -631,8 +652,8 @@ object DeltaLog extends DeltaLogging {
    * We create only a single [[DeltaLog]] for any given path to avoid wasted work
    * in reconstructing the log.
    */
-  private val deltaLogCache =
-    CacheBuilder.newBuilder()
+  private val deltaLogCache = {
+    val builder = CacheBuilder.newBuilder()
       .expireAfterAccess(60, TimeUnit.MINUTES)
       .removalListener(new RemovalListener[Path, DeltaLog] {
         override def onRemoval(removalNotification: RemovalNotification[Path, DeltaLog]) = {
@@ -643,7 +664,11 @@ object DeltaLog extends DeltaLogging {
           }
         }
       })
-      .build[Path, DeltaLog]()
+    sys.props.get("delta.log.cacheSize")
+      .flatMap(v => Try(v.toLong).toOption)
+      .foreach(builder.maximumSize)
+    builder.build[Path, DeltaLog]()
+  }
 
   /** Helper for creating a log when it stored at the root of the data. */
   def forTable(spark: SparkSession, dataPath: String): DeltaLog = {
@@ -674,37 +699,6 @@ object DeltaLog extends DeltaLogging {
   def forTable(spark: SparkSession, dataPath: Path, clock: Clock): DeltaLog = {
     apply(spark, new Path(dataPath, "_delta_log"), clock)
   }
-
-  /** Helper for creating a log for the table. */
-  def forTable(spark: SparkSession, tableName: TableIdentifier): DeltaLog = {
-    forTable(spark, tableName, new SystemClock)
-  }
-
-  /** Helper for creating a log for the table. */
-  def forTable(spark: SparkSession, table: CatalogTable): DeltaLog = {
-    forTable(spark, table, new SystemClock)
-  }
-
-  /** Helper for creating a log for the table. */
-  def forTable(spark: SparkSession, tableName: TableIdentifier, clock: Clock): DeltaLog = {
-    val catalog = spark.sessionState.catalog
-    forTable(spark, catalog.getTableMetadata(tableName), clock)
-  }
-
-  /** Helper for creating a log for the table. */
-  def forTable(spark: SparkSession, table: CatalogTable, clock: Clock): DeltaLog = {
-    apply(spark, new Path(new Path(table.location), "_delta_log"), clock)
-  }
-
-  /** Helper for creating a log for the table. */
-  def forTable(spark: SparkSession, deltaTable: DeltaTableIdentifier): DeltaLog = {
-    if (deltaTable.path.isDefined) {
-      forTable(spark, deltaTable.path.get)
-    } else {
-      forTable(spark, deltaTable.table.get)
-    }
-  }
-
   // TODO: Don't assume the data path here.
   def apply(spark: SparkSession, rawPath: Path, clock: Clock = new SystemClock): DeltaLog = {
     val fs = rawPath.getFileSystem(spark.sessionState.newHadoopConf())
@@ -735,6 +729,18 @@ object DeltaLog extends DeltaLogging {
     } else {
       deltaLogCache.invalidate(path)
       apply(spark, path)
+    }
+  }
+
+  /** Invalidate the cached DeltaLog object for the given `dataPath`. */
+  def invalidateCache(spark: SparkSession, dataPath: Path): Unit = {
+    try {
+      val rawPath = new Path(dataPath, "_delta_log")
+      val fs = rawPath.getFileSystem(spark.sessionState.newHadoopConf())
+      val path = fs.makeQualified(rawPath)
+      deltaLogCache.invalidate(path)
+    } catch {
+      case NonFatal(e) => logWarning(e.getMessage, e)
     }
   }
 
